@@ -13,6 +13,14 @@ const PORT = process.env.PORT || 3001;
 // Enable CORS for frontend
 app.use(cors());
 app.use(express.json());
+// Serve static frontend
+const path = require('path');
+app.use(express.static(__dirname));
+
+// Serve index.html for root route
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
