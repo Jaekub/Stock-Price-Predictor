@@ -8,11 +8,37 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(__dirname));
 
-// Simple in-memory cache for news
+// Cache for news
 const newsCache = new Map();
 const CACHE_DURATION = 3600000; // 1 hour
 
+// Cache for Yahoo stock data
+const stockCache = new Map();
+const STOCK_CACHE_DURATION = 1800000; // 30 min
+
 const NEWS_API_KEY = process.env.NEWS_API_KEY || '';
+
+const YAHOO_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+};
+
+async function fetchYahoo(symbol) {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=1y&interval=1d`;
+
+    try {
+        const res = await axios.get(url, { timeout: 10000, headers: YAHOO_HEADERS });
+        return res;
+    } catch (err) {
+        // Retry once after 2s if rate limited
+        if (err.response?.status === 429) {
+            console.warn('Yahoo 429 — retrying after 2s...');
+            await new Promise(r => setTimeout(r, 2000));
+            return axios.get(url, { timeout: 10000, headers: YAHOO_HEADERS });
+        }
+        throw err;
+    }
+}
 
 function analyzeSentiment(text) {
     const positive = ['gain','growth','profit','surge','strong','positive','bullish','rise','beat','up'];
@@ -88,34 +114,40 @@ app.get('/api/stock/:symbol', async (req, res) => {
     let responded = false;
 
     try {
-        const yahooURL = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=1y&interval=1d`;
-        const stockResponse = await axios.get(yahooURL, { timeout: 10000 });
+        // Check stock cache first to avoid hammering Yahoo
+        let historical;
+        const cachedStock = stockCache.get(symbol);
+        if (cachedStock && Date.now() - cachedStock.timestamp < STOCK_CACHE_DURATION) {
+            historical = cachedStock.historical;
+            console.log(`Stock cache hit for ${symbol}`);
+        } else {
+            const stockResponse = await fetchYahoo(symbol);
+            const result = stockResponse.data.chart?.result?.[0];
+            if (!result?.timestamp) {
+                return res.json({ success: false, error: "No chart data from Yahoo" });
+            }
 
-        const result = stockResponse.data.chart?.result?.[0];
-        if (!result?.timestamp) {
-            return res.json({ success: false, error: "No chart data from Yahoo" });
-        }
+            const timestamps = result.timestamp;
+            const closes = result.indicators.quote[0].close;
 
-        const timestamps = result.timestamp;
-        const closes = result.indicators.quote[0].close;
+            historical = timestamps.map((t, i) => ({
+                date: new Date(t * 1000).toISOString().split('T')[0],
+                close: closes[i]
+            })).filter(d => d.close !== null && !isNaN(d.close));
 
-        const historical = timestamps.map((t, i) => ({
-            date: new Date(t * 1000).toISOString().split('T')[0],
-            close: closes[i]
-        })).filter(d => d.close !== null && !isNaN(d.close));
+            if (historical.length < 20) {
+                return res.json({ success: false, error: "Not enough historical data" });
+            }
 
-        if (historical.length < 20) {
-            return res.json({ success: false, error: "Not enough historical data" });
+            stockCache.set(symbol, { historical, timestamp: Date.now() });
+            console.log(`Stock cached for ${symbol}`);
         }
 
         // Work out how many trading days stale Yahoo's data is vs today
         const lastDataDate = new Date(historical[historical.length - 1].date);
         const today = new Date();
         today.setHours(0, 0, 0, 0);
-        const staleDays = countTradingDays(lastDataDate, today);
-
-        // Ask Python for enough extra days to bridge the gap, so that
-        // prediction[staleDays] is "tomorrow" from today's perspective
+        const staleDays = Math.max(0, countTradingDays(lastDataDate, today));
         const daysToRequest = days + staleDays;
 
         const pythonCmd = process.platform === 'win32' ? 'py' : 'python3';
@@ -159,7 +191,6 @@ app.get('/api/stock/:symbol', async (req, res) => {
                 return res.json({ success: false, error: prediction.error });
             }
 
-            // Slice off the stale-gap days so index 0 = tomorrow from today
             const mlPred = (prediction.predictions || []).slice(staleDays, staleDays + days);
 
             let sentiment = { overallSentiment: 0, sentimentLabel: "neutral", newsCount: 0, recentNews: [] };
@@ -177,10 +208,7 @@ app.get('/api/stock/:symbol', async (req, res) => {
                         const newsRes = await axios.get(newsURL, { timeout: 8000 });
                         sentiment = summarizeSentiment(newsRes.data.articles || []);
 
-                        newsCache.set(cacheKey, {
-                            sentiment,
-                            timestamp: Date.now()
-                        });
+                        newsCache.set(cacheKey, { sentiment, timestamp: Date.now() });
                         console.log(`News cached for ${cleanSymbol}`);
                     } catch (newsErr) {
                         console.warn("News fetch failed:", newsErr.message);
