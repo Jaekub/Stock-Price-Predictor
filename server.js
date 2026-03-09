@@ -16,7 +16,11 @@ const CACHE_DURATION = 3600000; // 1 hour
 const stockCache = new Map();
 const STOCK_CACHE_DURATION = 1800000; // 30 min
 
-const NEWS_API_KEY = process.env.NEWS_API_KEY || '';
+// Cache for Python predictions (always 30 days, sliced per request)
+const predCache = new Map();
+const PRED_CACHE_DURATION = 1800000; // 30 min — matches stock cache
+
+const NEWS_API_KEY = process.env.NEWS_API_KEY || '798868e200de40ceb20d89cdb678e82e';
 
 const YAHOO_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -30,7 +34,6 @@ async function fetchYahoo(symbol) {
         const res = await axios.get(url, { timeout: 10000, headers: YAHOO_HEADERS });
         return res;
     } catch (err) {
-        // Retry once after 2s if rate limited
         if (err.response?.status === 429) {
             console.warn('Yahoo 429 — retrying after 2s...');
             await new Promise(r => setTimeout(r, 2000));
@@ -61,6 +64,15 @@ function summarizeSentiment(articles) {
     if (!articles?.length) {
         return { overallSentiment: 0, sentimentLabel: "neutral", newsCount: 0, recentNews: [] };
     }
+
+    // Deduplicate by title (NewsAPI sometimes returns same article with different URLs)
+    const seen = new Set();
+    articles = articles.filter(a => {
+        const key = (a.title || '').trim().toLowerCase();
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 
     let totalScore = 0;
     const processed = articles.map(a => {
@@ -106,12 +118,41 @@ function countTradingDays(fromDate, toDate) {
     return count;
 }
 
+function runPython(historical, daysToRequest) {
+    return new Promise((resolve, reject) => {
+        const pythonCmd = process.platform === 'win32' ? 'py' : 'python3';
+        const py = spawn(pythonCmd, ['predictor.py', daysToRequest.toString()]);
+
+        let pyData = '';
+        let pyError = '';
+
+        py.stdout.on('data', d => pyData += d.toString());
+        py.stderr.on('data', d => pyError += d.toString());
+
+        py.on('error', err => reject(new Error('Failed to start Python: ' + err.message)));
+
+        py.on('close', (code) => {
+            if (code !== 0) return reject(new Error('Python error\n' + pyError.slice(-400)));
+            if (!pyData.trim()) return reject(new Error('Empty response from model'));
+
+            let prediction;
+            try { prediction = JSON.parse(pyData); }
+            catch (e) { return reject(new Error('Invalid prediction format')); }
+
+            if (prediction.error) return reject(new Error(prediction.error));
+
+            resolve(prediction.predictions);
+        });
+
+        py.stdin.write(JSON.stringify(historical));
+        py.stdin.end();
+    });
+}
+
 app.get('/api/stock/:symbol', async (req, res) => {
     const symbol = req.params.symbol;
     const cleanSymbol = symbol.split('.')[0];
     const days = Math.min(parseInt(req.query.days || 30) || 30, 365);
-
-    let responded = false;
 
     try {
         // Check stock cache first to avoid hammering Yahoo
@@ -148,102 +189,87 @@ app.get('/api/stock/:symbol', async (req, res) => {
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         const staleDays = Math.max(0, countTradingDays(lastDataDate, today));
-        const daysToRequest = days + staleDays;
 
-        const pythonCmd = process.platform === 'win32' ? 'py' : 'python3';
-        const py = spawn(pythonCmd, ['predictor.py', daysToRequest.toString()]);
+        // Always request 30 days from Python so cache covers all horizons
+        const MAX_DAYS = 30;
+        const daysToRequest = MAX_DAYS + staleDays;
 
-        let pyData = '';
-        let pyError = '';
-
-        py.stdout.on('data', d => pyData += d.toString());
-        py.stderr.on('data', d => pyError += d.toString());
-
-        py.on('error', err => {
-            if (responded) return;
-            responded = true;
-            console.error("Spawn error:", err);
-            res.json({ success: false, error: "Failed to start Python" });
-        });
-
-        py.on('close', async (code) => {
-            if (responded) return;
-            responded = true;
-
-            if (code !== 0) {
-                console.error(`Python exited ${code}\n${pyError}`);
-                return res.json({ success: false, error: "Python error\n" + pyError.slice(-400) });
-            }
-
-            if (!pyData.trim()) {
-                return res.json({ success: false, error: "Empty response from model" });
-            }
-
-            let prediction;
+        // Check prediction cache
+        let allPredictions;
+        const cachedPred = predCache.get(symbol);
+        if (cachedPred && Date.now() - cachedPred.timestamp < PRED_CACHE_DURATION) {
+            allPredictions = cachedPred.predictions;
+            console.log(`Prediction cache hit for ${symbol}`);
+        } else {
             try {
-                prediction = JSON.parse(pyData);
-            } catch (e) {
-                console.error("Invalid JSON:", pyData);
-                return res.json({ success: false, error: "Invalid prediction format" });
+                allPredictions = await runPython(historical, daysToRequest);
+                predCache.set(symbol, { predictions: allPredictions, timestamp: Date.now() });
+                console.log(`Predictions cached for ${symbol}`);
+            } catch (err) {
+                return res.json({ success: false, error: err.message });
             }
+        }
 
-            if (prediction.error) {
-                return res.json({ success: false, error: prediction.error });
-            }
+        // Slice to the requested horizon starting from today
+        const mlPred = allPredictions.slice(staleDays, staleDays + days);
 
-            const mlPred = (prediction.predictions || []).slice(staleDays, staleDays + days);
+        let sentiment = { overallSentiment: 0, sentimentLabel: "neutral", newsCount: 0, recentNews: [] };
 
-            let sentiment = { overallSentiment: 0, sentimentLabel: "neutral", newsCount: 0, recentNews: [] };
+        const companyNames = {
+            'RELIANCE': 'Reliance Industries',
+            'TCS': 'Tata Consultancy Services',
+            'HDFCBANK': 'HDFC Bank',
+            'INFY': 'Infosys',
+            'SBIN': 'State Bank of India',
+            'BHARTIARTL': 'Bharti Airtel',
+            'ITC': 'ITC Limited',
+            'ICICIBANK': 'ICICI Bank'
+        };
+        const newsQuery = companyNames[cleanSymbol] || cleanSymbol;
 
-            if (NEWS_API_KEY) {
-                const cacheKey = cleanSymbol;
-                const cached = newsCache.get(cacheKey);
+        if (NEWS_API_KEY) {
+            const cacheKey = cleanSymbol;
+            const cached = newsCache.get(cacheKey);
 
-                if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
-                    sentiment = cached.sentiment;
-                    console.log(`News cache hit for ${cleanSymbol}`);
-                } else {
-                    try {
-                        const newsURL = `https://newsapi.org/v2/everything?q=${cleanSymbol}&language=en&sortBy=publishedAt&pageSize=6&apiKey=${NEWS_API_KEY}`;
-                        const newsRes = await axios.get(newsURL, { timeout: 8000 });
-                        sentiment = summarizeSentiment(newsRes.data.articles || []);
+            if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+                sentiment = cached.sentiment;
+                console.log(`News cache hit for ${cleanSymbol}`);
+            } else {
+                try {
+                    const newsURL = `https://newsapi.org/v2/everything?q=${encodeURIComponent(newsQuery)}&language=en&sortBy=publishedAt&pageSize=6&apiKey=${NEWS_API_KEY}`;
+                    const newsRes = await axios.get(newsURL, { timeout: 8000 });
+                    sentiment = summarizeSentiment(newsRes.data.articles || []);
 
-                        newsCache.set(cacheKey, { sentiment, timestamp: Date.now() });
-                        console.log(`News cached for ${cleanSymbol}`);
-                    } catch (newsErr) {
-                        console.warn("News fetch failed:", newsErr.message);
-                    }
+                    newsCache.set(cacheKey, { sentiment, timestamp: Date.now() });
+                    console.log(`News cached for ${cleanSymbol}`);
+                } catch (newsErr) {
+                    console.warn("News fetch failed:", newsErr.message);
                 }
             }
+        }
 
-            const sentimentImpact = sentiment.overallSentiment;
-            const sentimentAdjusted = mlPred.map((price, i) => {
-                const decay = Math.exp(-i * 0.08);
-                const factor = 1 + (sentimentImpact * 0.015 * decay);
-                return Number((price * factor).toFixed(2));
-            });
-
-            res.json({
-                success: true,
-                data: historical,
-                prediction: {
-                    ml: mlPred,
-                    sentimentAdjusted,
-                    trend: prediction.trend || "neutral"
-                },
-                sentiment
-            });
+        const sentimentImpact = sentiment.overallSentiment;
+        const sentimentAdjusted = mlPred.map((price, i) => {
+            const decay = Math.exp(-i * 0.08);
+            const factor = 1 + (sentimentImpact * 0.015 * decay);
+            return Number((price * factor).toFixed(2));
         });
 
-        py.stdin.write(JSON.stringify(historical));
-        py.stdin.end();
+        res.json({
+            success: true,
+            data: historical,
+            prediction: {
+                ml: mlPred,
+                sentimentAdjusted,
+                trend: allPredictions[allPredictions.length - 1] > allPredictions[staleDays] ? "bullish" : "bearish"
+            },
+            sentiment
+        });
 
     } catch (err) {
-        if (!responded) {
-            console.error(err);
-            const msg = err.response?.status ? `Yahoo error ${err.response.status}` : err.message;
-            res.json({ success: false, error: msg });
-        }
+        console.error(err);
+        const msg = err.response?.status ? `Yahoo error ${err.response.status}` : err.message;
+        res.json({ success: false, error: msg });
     }
 });
 
