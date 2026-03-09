@@ -20,7 +20,7 @@ const STOCK_CACHE_DURATION = 1800000; // 30 min
 const predCache = new Map();
 const PRED_CACHE_DURATION = 1800000; // 30 min — matches stock cache
 
-const NEWS_API_KEY = process.env.NEWS_API_KEY || '798868e200de40ceb20d89cdb678e82e';
+const NEWS_API_KEY = process.env.NEWS_API_KEY || '';
 
 const YAHOO_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
