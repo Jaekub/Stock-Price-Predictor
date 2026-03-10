@@ -479,11 +479,16 @@ function updateSinglePrediction(hist, mlPrice, sentPrice, horizon, trend) {
 }
 
 function updateNews(sentiment) {
-    if (!sentiment || sentiment.newsCount === 0) return;
-
-    document.getElementById("newsSection").style.display = "block";
+    const newsSection = document.getElementById("newsSection");
     const container = document.getElementById("newsContainer");
     container.innerHTML = "";
+
+    if (!sentiment || sentiment.newsCount === 0) {
+        newsSection.style.display = "none";
+        return;
+    }
+
+    newsSection.style.display = "block";
 
     sentiment.recentNews.forEach(news => {
         const badgeClass =
