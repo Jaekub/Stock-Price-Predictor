@@ -236,22 +236,21 @@ app.get('/api/stock/:symbol', async (req, res) => {
                 console.log(`News cache hit for ${cleanSymbol}`);
             } else {
                 try {
-                    // Search for exact full name OR ticker symbol
-                    const searchQuery = companyNames[cleanSymbol]
-                        ? `"${companyNames[cleanSymbol]}" OR "${cleanSymbol}"`
-                        : cleanSymbol;
-                    const newsURL = `https://newsapi.org/v2/everything?q=${encodeURIComponent(searchQuery)}&language=en&sortBy=publishedAt&pageSize=10&apiKey=${NEWS_API_KEY}`;
+                    // TCS is more commonly referenced by ticker in news; others use full name
+                    const tickerSearch = ['TCS', 'INFY'];
+                    const searchQuery = tickerSearch.includes(cleanSymbol)
+                        ? `"${cleanSymbol}"`
+                        : companyNames[cleanSymbol]
+                            ? `"${companyNames[cleanSymbol]}"`
+                            : `"${cleanSymbol}"`;
+                    const newsURL = `https://newsapi.org/v2/everything?q=${encodeURIComponent(searchQuery)}&language=en&sortBy=publishedAt&pageSize=6&apiKey=${NEWS_API_KEY}`;
                     const newsRes = await axios.get(newsURL, { timeout: 8000 });
 
-                    // Filter out articles that don't mention the company or ticker in title/description
-                    // Include ticker, full name, and first word of company name (e.g. "Reliance" from "Reliance Industries")
-                    const firstWord = (companyNames[cleanSymbol] || '').split(' ')[0].toLowerCase();
-                    const keywords = [cleanSymbol.toLowerCase(), newsQuery.toLowerCase(), firstWord].filter(Boolean);
+                    const keywords = [cleanSymbol.toLowerCase(), (companyNames[cleanSymbol] || '').toLowerCase()].filter(Boolean);
                     const filtered = (newsRes.data.articles || []).filter(a => {
-                        const text = ((a.title || '') + ' ' + (a.description || '')).toLowerCase();
-                        return keywords.some(k => text.includes(k));
+                        const title = (a.title || '').toLowerCase();
+                        return keywords.some(k => k && title.includes(k));
                     }).slice(0, 6);
-
                     sentiment = summarizeSentiment(filtered);
 
                     newsCache.set(cacheKey, { sentiment, timestamp: Date.now() });
@@ -275,7 +274,7 @@ app.get('/api/stock/:symbol', async (req, res) => {
             prediction: {
                 ml: mlPred,
                 sentimentAdjusted,
-                trend: allPredictions[allPredictions.length - 1] > allPredictions[staleDays] ? "bullish" : "bearish"
+                trend: mlPred[mlPred.length - 1] > mlPred[0] ? "bullish" : "bearish"
             },
             sentiment
         });
