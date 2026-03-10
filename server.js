@@ -236,9 +236,23 @@ app.get('/api/stock/:symbol', async (req, res) => {
                 console.log(`News cache hit for ${cleanSymbol}`);
             } else {
                 try {
-                    const newsURL = `https://newsapi.org/v2/everything?q=${encodeURIComponent(newsQuery)}&language=en&sortBy=publishedAt&pageSize=6&apiKey=${NEWS_API_KEY}`;
+                    // Search for exact full name OR ticker symbol
+                    const searchQuery = companyNames[cleanSymbol]
+                        ? `"${companyNames[cleanSymbol]}" OR "${cleanSymbol}"`
+                        : cleanSymbol;
+                    const newsURL = `https://newsapi.org/v2/everything?q=${encodeURIComponent(searchQuery)}&language=en&sortBy=publishedAt&pageSize=10&apiKey=${NEWS_API_KEY}`;
                     const newsRes = await axios.get(newsURL, { timeout: 8000 });
-                    sentiment = summarizeSentiment(newsRes.data.articles || []);
+
+                    // Filter out articles that don't mention the company or ticker in title/description
+                    // Include ticker, full name, and first word of company name (e.g. "Reliance" from "Reliance Industries")
+                    const firstWord = (companyNames[cleanSymbol] || '').split(' ')[0].toLowerCase();
+                    const keywords = [cleanSymbol.toLowerCase(), newsQuery.toLowerCase(), firstWord].filter(Boolean);
+                    const filtered = (newsRes.data.articles || []).filter(a => {
+                        const text = ((a.title || '') + ' ' + (a.description || '')).toLowerCase();
+                        return keywords.some(k => text.includes(k));
+                    }).slice(0, 6);
+
+                    sentiment = summarizeSentiment(filtered);
 
                     newsCache.set(cacheKey, { sentiment, timestamp: Date.now() });
                     console.log(`News cached for ${cleanSymbol}`);
